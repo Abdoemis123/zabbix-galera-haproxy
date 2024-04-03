@@ -1,0 +1,566 @@
+# Source: zabbix/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+automountServiceAccountToken: true
+metadata:
+  name: release-name-zabbix
+  labels:
+    app: release-name-zabbix-serviceaccount
+    helm.sh/chart: zabbix-4.2.1
+    app.kubernetes.io/name: zabbix
+    helm.sh/chart: zabbix-4.2.1
+    app.kubernetes.io/instance: release-name
+    app.kubernetes.io/version: "6.0.27"
+    app.kubernetes.io/managed-by: Helm
+---
+# Source: zabbix/templates/secret-db-access.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zabbixdb-mysqluser-zabbix
+  annotations:
+    "helm.sh/resource-policy": keep
+  labels:
+    app: release-name-zabbix-db-access
+    app.kubernetes.io/name: db-access
+    helm.sh/chart: zabbix-4.2.1
+    app.kubernetes.io/instance: release-name-db-access
+    app.kubernetes.io/managed-by: Helm-db-access
+type: Opaque
+data:
+# host: "bXktcmVsZWFzZS1tYXJpYWRiLWdhbGVyYQ=="
+  host: MTcyLjIxMi4xMTYuMTI2
+  port: "MzMwNg=="
+  dbname: "emFiYml4"
+  user: "emFiYml4"
+  password: "ZDJicmphZDhiYg=="
+---
+# Source: zabbix/templates/configmap-zabbix-server-init-waitschema.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: release-name-zabbix-waitdbschema-script
+  labels:
+    app: release-name-zabbix-waitdbschema-script
+    app.kubernetes.io/name: waitdbschema-script
+    helm.sh/chart: zabbix-4.2.1
+    app.kubernetes.io/instance: release-name-waitdbschema-script
+    app.kubernetes.io/managed-by: Helm-waitdbschema-script
+data:
+  wait_db_schema.sh: |
+    #!/bin/bash
+
+    set -o pipefail
+
+    set +e
+
+    # Script trace mode
+    if [ "${DEBUG_MODE,,}" == "true" ]; then
+        set -o xtrace
+    fi
+
+    # Default directories
+    # User 'zabbix' home directory
+    ZABBIX_USER_HOME_DIR="/var/lib/zabbix"
+    # Configuration files directory
+    ZABBIX_ETC_DIR="/etc/zabbix"
+
+    # usage: file_env VAR [DEFAULT]
+    # as example: file_env 'MYSQL_PASSWORD' 'zabbix'
+    #    (will allow for "$MYSQL_PASSWORD_FILE" to fill in the value of "$MYSQL_PASSWORD" from a file)
+    # unsets the VAR_FILE afterwards and just leaving VAR
+    file_env() {
+        local var="$1"
+        local fileVar="${var}_FILE"
+        local defaultValue="${2:-}"
+
+        if [ "${!var:-}" ] && [ "${!fileVar:-}" ]; then
+            echo "**** Both variables $var and $fileVar are set (but are exclusive)"
+            exit 1
+        fi
+
+        local val="$defaultValue"
+
+        if [ "${!var:-}" ]; then
+            val="${!var}"
+            echo "** Using ${var} variable from ENV"
+        elif [ "${!fileVar:-}" ]; then
+            if [ ! -f "${!fileVar}" ]; then
+                echo "**** Secret file \"${!fileVar}\" is not found"
+                exit 1
+            fi
+            val="$(< "${!fileVar}")"
+            echo "** Using ${var} variable from secret file"
+        fi
+        export "$var"="$val"
+        unset "$fileVar"
+    }
+
+    db_tls_params() {
+        local result=""
+
+        if [ -n "${ZBX_DBTLSCONNECT}" ]; then
+            ssl_mode=${ZBX_DBTLSCONNECT//verify_full/verify_identity}
+            result="--ssl-mode=$ssl_mode"
+
+            if [ -n "${ZBX_DBTLSCAFILE}" ]; then
+                result="${result} --ssl-ca=${ZBX_DBTLSCAFILE}"
+            fi
+
+            if [ -n "${ZBX_DBTLSKEYFILE}" ]; then
+                result="${result} --ssl-key=${ZBX_DBTLSKEYFILE}"
+            fi
+
+            if [ -n "${ZBX_DBTLSCERTFILE}" ]; then
+                result="${result} --ssl-cert=${ZBX_DBTLSCERTFILE}"
+            fi
+        fi
+
+        echo $result
+    }
+
+
+
+
+    # Check prerequisites for PostgreSQL database
+    check_variables_mysql() {
+        if [ ! -n "${DB_SERVER_SOCKET}" ]; then
+            : ${DB_SERVER_HOST:="my-release-mariadb-galera"}
+            : ${DB_SERVER_PORT:="3306"}
+        fi
+
+        USE_DB_ROOT_USER=false
+        CREATE_ZBX_DB_USER=false
+        file_env MYSQL_USER
+        file_env MYSQL_PASSWORD
+
+        file_env MYSQL_ROOT_USER
+        file_env MYSQL_ROOT_PASSWORD
+
+        MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-"d2brjad8bb"}
+
+        if [ ! -n "${MYSQL_USER}" ] && [ "${MYSQL_RANDOM_ROOT_PASSWORD,,}" == "true" ]; then
+            echo "**** Impossible to use MySQL server because of unknown Zabbix user and random 'root' password"
+            exit 1
+        fi
+
+        if [ ! -n "${MYSQL_USER}" ] && [ ! -n "${MYSQL_ROOT_PASSWORD}" ] && [ "${MYSQL_ALLOW_EMPTY_PASSWORD,,}" != "true" ]; then
+            echo "*** Impossible to use MySQL server because 'root' password is not defined and it is not empty"
+            exit 1
+        fi
+
+        if [ "${MYSQL_ALLOW_EMPTY_PASSWORD,,}" == "true" ] || [ -n "${MYSQL_ROOT_PASSWORD}" ]; then
+            USE_DB_ROOT_USER=true
+            DB_SERVER_ROOT_USER=${MYSQL_ROOT_USER:-"root"}
+            DB_SERVER_ROOT_PASS=${MYSQL_ROOT_PASSWORD:-"d2brjad8bb"}
+        fi
+
+        [ -n "${MYSQL_USER}" ] && [ "${USE_DB_ROOT_USER}" == "true" ] && CREATE_ZBX_DB_USER=true
+
+        # If root password is not specified use provided credentials
+        : ${DB_SERVER_ROOT_USER:=${MYSQL_USER}}
+        [ "${MYSQL_ALLOW_EMPTY_PASSWORD,,}" == "true" ] || DB_SERVER_ROOT_PASS=${DB_SERVER_ROOT_PASS:-${MYSQL_PASSWORD}}
+        DB_SERVER_ZBX_USER=${MYSQL_USER:-"root"}
+        DB_SERVER_ZBX_PASS=${MYSQL_PASSWORD:-"d2brjad8bb"}
+
+        DB_SERVER_DBNAME=${MYSQL_DATABASE:-"zabbix"}
+
+        if [ ! -n "${DB_SERVER_SOCKET}" ]; then
+            mysql_connect_args="-h ${DB_SERVER_HOST} -P ${DB_SERVER_PORT}"
+        else
+            mysql_connect_args="-S ${DB_SERVER_SOCKET}"
+        fi
+    }
+
+    check_db_connect_mysql() {
+        echo "********************"
+        if [ ! -n "${DB_SERVER_SOCKET}" ]; then
+            echo "* DB_SERVER_HOST: ${DB_SERVER_HOST}"
+            echo "* DB_SERVER_PORT: ${DB_SERVER_PORT}"
+        else
+            echo "* DB_SERVER_SOCKET: ${DB_SERVER_SOCKET}"
+        fi
+        echo "* DB_SERVER_DBNAME: ${DB_SERVER_DBNAME}"
+        if [ "${DEBUG_MODE,,}" == "true" ]; then
+            if [ "${USE_DB_ROOT_USER}" == "true" ]; then
+                echo "* DB_SERVER_ROOT_USER: ${DB_SERVER_ROOT_USER}"
+                echo "* DB_SERVER_ROOT_PASS: ${DB_SERVER_ROOT_PASS}"
+            fi
+            echo "* DB_SERVER_ZBX_USER: ${DB_SERVER_ZBX_USER}"
+            echo "* DB_SERVER_ZBX_PASS: ${DB_SERVER_ZBX_PASS}"
+        fi
+        echo "********************"
+
+        WAIT_TIMEOUT=5
+
+        ssl_opts="$(db_tls_params)"
+
+        export MYSQL_PWD="${DB_SERVER_ROOT_PASS}"
+
+        while [ ! "$(mysqladmin ping $mysql_connect_args -u ${DB_SERVER_ROOT_USER} \
+                    --silent --connect_timeout=10 $ssl_opts)" ]; do
+            echo "**** MySQL server is not available. Waiting $WAIT_TIMEOUT seconds..."
+            sleep $WAIT_TIMEOUT
+        done
+
+        unset MYSQL_PWD
+    }
+
+    mysql_query() {
+        query=$1
+        local result=""
+
+        ssl_opts="$(db_tls_params)"
+
+        export MYSQL_PWD="${DB_SERVER_ROOT_PASS}"
+
+        result=$(mysql --silent --skip-column-names $mysql_connect_args \
+                -u ${DB_SERVER_ROOT_USER} -e "$query" $ssl_opts)
+
+        unset MYSQL_PWD
+
+        echo $result
+    }
+
+    update_priv() {
+
+       mysql_query "SET GLOBAL log_bin_trust_function_creators = 1;" 1>/dev/null
+
+    }
+
+
+    check_db_user_mysql() {
+        WAIT_TIMEOUT=5
+        while true :
+        do
+            DB_AMOUNT_USERS=$(mysql_query "SELECT COUNT(*) FROM ${DB_SERVER_DBNAME}.users;")
+            if [ ${DB_AMOUNT_USERS} ]; then
+                echo "** amount of users in users table is ${DB_AMOUNT_USERS}, letting the Zabbix Server container start"
+                break
+            fi
+            echo "**** DB amount of entries in user table is ${DB_AMOUNT_USERS}. Waiting $WAIT_TIMEOUT seconds..."
+            sleep $WAIT_TIMEOUT
+        done
+    }
+
+    check_db_schema_mysql() {
+        WAIT_TIMEOUT=5
+        while true :
+        do
+            DBVERSION_TABLE_EXISTS=$(mysql_query "SELECT 1 FROM information_schema.tables WHERE table_schema='${DB_SERVER_DBNAME}' and table_name = 'dbversion'")
+
+            if [ -n "${DBVERSION_TABLE_EXISTS}" ]; then
+                echo "** Table '${DB_SERVER_DBNAME}.dbversion' exists."
+                ZBX_DB_VERSION=$(mysql_query "SELECT mandatory FROM ${DB_SERVER_DBNAME}.dbversion")
+            fi
+            if [ -n "${ZBX_DB_VERSION}" ]; then
+                echo "** dbversion is ${ZBX_DB_VERSION}, continuing with next step of checks..."
+                break
+            fi
+            echo "**** DB Version not found yet, assuming DB schema is not yet created. Waiting $WAIT_TIMEOUT seconds..."
+            sleep $WAIT_TIMEOUT
+        done
+    }
+
+    wait_for_db_and_schema() {
+        echo "** waiting for Zabbix DB to be operational to start Zabbix server container"
+        update_priv
+        check_variables_mysql
+        check_db_connect_mysql
+        check_db_schema_mysql
+        check_db_user_mysql
+    }
+
+    wait_for_db_and_schema
+---
+# Source: zabbix/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: release-name-zabbix-zabbix-server
+  labels:
+    app: release-name-zabbix-zabbix-server
+    app.kubernetes.io/name: zabbix-server
+    helm.sh/chart: zabbix-4.2.1
+    app.kubernetes.io/instance: release-name-zabbix-server
+    app.kubernetes.io/managed-by: Helm-zabbix-server
+spec:
+  type: ClusterIP
+  ports:
+    - port: 10051
+      targetPort: 10051
+      name: zabbix-server
+      protocol: TCP
+    - port: 10052
+      targetPort: 10052
+      protocol: TCP
+      name: zabbix-jmx
+  selector:
+    app: release-name-zabbix-zabbix-server
+---
+# Source: zabbix/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: release-name-zabbix-zabbix-web
+  labels:
+    app: release-name-zabbix-zabbix-web
+    app.kubernetes.io/name: zabbix-web
+    helm.sh/chart: zabbix-4.2.1
+    app.kubernetes.io/instance: release-name-zabbix-web
+    app.kubernetes.io/managed-by: Helm-zabbix-web
+spec:
+  type: ClusterIP 
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: zabbix-web
+  selector:
+    app: release-name-zabbix-zabbix-web
+---
+# Source: zabbix/templates/deployment-zabbix-server.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: release-name-zabbix-zabbix-server
+  labels:
+    app: release-name-zabbix-zabbix-server
+    app.kubernetes.io/name: zabbix-server
+    helm.sh/chart: zabbix-4.2.1
+    app.kubernetes.io/instance: release-name-zabbix-server
+    app.kubernetes.io/managed-by: Helm-zabbix-server
+  annotations:
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: release-name-zabbix-zabbix-server
+  template:
+    metadata:
+      annotations:
+      labels:
+        app: release-name-zabbix-zabbix-server
+        app.kubernetes.io/name: zabbix-server
+        helm.sh/chart: zabbix-4.2.1
+        app.kubernetes.io/instance: release-name-zabbix-server
+        app.kubernetes.io/managed-by: Helm-zabbix-server
+    spec:
+      serviceAccountName: release-name-zabbix
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: release-name-zabbix-server
+      initContainers:
+        - name: init-wait-for-database-schema
+          image: "zabbix/zabbix-server-mysql:ubuntu-6.4.12"
+          env:
+          securityContext:
+            {}
+          resources:
+            {}
+          command:
+            - "/bin/bash"
+            - "/script/wait_db_schema.sh"
+          volumeMounts:
+            - name: init-waitschema-script
+              mountPath: /script
+      containers:
+        - name: zabbix-server
+          resources:
+            {}
+          securityContext:
+            {}
+          image: "zabbix/zabbix-server-mysql:ubuntu-6.4.12"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 10051
+              name: zabbix-server
+            - containerPort: 10052
+              name: zabbix-jmx
+          env:
+
+            - name: LogSlowQueries
+              value: "300"
+            - name: DB_SERVER_HOST
+              value: "haproxy-deployment.default.svc.cluster.local"
+             # valueFrom:
+              #  secretKeyRef:
+               #   name: zabbixdb-mysqluser-zabbix
+                #  key: host
+            - name: DB_SERVER_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: zabbixdb-mysqluser-zabbix
+                  key: port
+                  optional: true
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: zabbixdb-mysqluser-zabbix
+                  key: user
+                  optional: true
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zabbixdb-mysqluser-zabbix
+                  key: password
+            - name: MYSQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: zabbixdb-mysqluser-zabbix
+                  key: dbname
+                  optional: true
+            - name: ZBX_AUTOHANODENAME
+              value: "hostname"
+            - name: ZBX_NODEADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+      imagePullSecrets:
+      volumes:
+        - name: init-waitschema-script
+          configMap:
+            name: release-name-zabbix-waitdbschema-script
+---
+# Source: zabbix/templates/deployment-zabbix-web.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: release-name-zabbix-zabbix-web
+  labels:
+    app: release-name-zabbix-zabbix-web
+    app.kubernetes.io/name: zabbix-web
+    helm.sh/chart: zabbix-4.2.1
+    app.kubernetes.io/instance: release-name-zabbix-web
+    app.kubernetes.io/managed-by: Helm-zabbix-web
+  annotations:
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app:  release-name-zabbix-zabbix-web
+  template:
+    metadata:
+      annotations:
+      labels:
+        app: release-name-zabbix-zabbix-web
+        app.kubernetes.io/name: zabbix-web
+        helm.sh/chart: zabbix-4.2.1
+        app.kubernetes.io/instance: release-name-zabbix-web
+        app.kubernetes.io/managed-by: Helm-zabbix-web
+    spec:
+      serviceAccountName: release-name-zabbix
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: release-name-zabbix-web
+      containers:
+      - name: zabbix-web
+        resources:
+          {}
+        securityContext:
+          {}
+        image: "zabbix/zabbix-web-nginx-mysql:ubuntu-6.4.12"
+        imagePullPolicy: IfNotPresent
+        env:
+
+
+            - name: DB_SERVER_HOST
+              value: "haproxy-deployment.default.svc.cluster.local"
+              # valueFrom:
+               #  secretKeyRef:
+                 #  name: zabbixdb-mysqluser-zabbix
+                 #  key: host
+            - name: DB_SERVER_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: zabbixdb-mysqluser-zabbix
+                  key: port
+                  optional: true
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: zabbixdb-mysqluser-zabbix
+                  key: user
+                  optional: true
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: zabbixdb-mysqluser-zabbix
+                  key: password
+            - name: MYSQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: zabbixdb-mysqluser-zabbix
+                  key: dbname
+                  optional: true
+        ports:
+          - name: zabbix-web
+            containerPort: 8080
+            protocol: TCP
+        volumeMounts:
+        livenessProbe:
+          httpGet:
+            path: /
+            port: zabbix-web
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 6
+        readinessProbe:
+          httpGet:
+            path: /
+            port: zabbix-web
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 6
+      imagePullSecrets:
+      volumes:
+---
+# Source: zabbix/templates/job-init-db-schema.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: release-name-zabbix-init-db-schema
+  labels:
+    app: release-name-zabbix-init-db-schema
+    app.kubernetes.io/name: init-db-schema
+    helm.sh/chart: zabbix-4.2.1
+    app.kubernetes.io/instance: release-name-init-db-schema
+    app.kubernetes.io/managed-by: Helm-init-db-schema
+spec:
+  ttlSecondsAfterFinished: 120
+  template:
+    spec:
+      containers:
+      - name: init-db-schema
+        image: "zabbix/zabbix-server-mysql:ubuntu-6.4.12"
+        securityContext:
+          {}
+        env:
+          - name: ZBX_AUTOHANODENAME
+            value: "hostname"
+          - name: ZBX_NODEADDRESS
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+        command:
+          - "/bin/sh"
+          - "-c"
+          - 'export V=$(zabbix_server -V | head -n 1 | sed "s/.*\([0-9]\+\.[0-9]\+\.[0-9]\+\)/\1/"); if [ "$V" = "`echo -e "$V\n6.2.6" | sort -V | head -n1`" ]; then sed -e "s/^exec \"\$@\"$/prepare_server/" -e "/^ *update_zbx_config$/d" /usr/bin/docker-entrypoint.sh >~/docker-entrypoint.sh && MYSQL_ROOT_PASSWORD=d2brjad8bb DB_SERVER_HOST=my-release-mariadb-galera bash ~/docker-entrypoint.sh; else MYSQL_ROOT_PASSWORD=d2brjad8bb MYSQL_DATABASE=zabbix MYSQL_USER=zabbix  MYSQL_PASSWORD=d2brjad8bb DB_SERVER_HOST=my-release-mariadb-galera /usr/bin/docker-entrypoint.sh init_db_only; fi'
+      imagePullSecrets:
+      restartPolicy: Never
